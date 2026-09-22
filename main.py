@@ -1,9 +1,38 @@
-import re
+#!/usr/bin/env python3
+"""
+USB HID CPU/GPU/fan display driver for coolers without native Linux support.
+
+Sensor reading strategy (in order of preference):
+  1. psutil (reads Linux hwmon sysfs directly - no locale/formatting issues)
+  2. `sensors -j` (lm-sensors JSON output - structured, no regex needed)
+  3. Raw hwmon sysfs scan (last resort, no dependencies at all)
+
+GPU:
+  - NVIDIA: nvidia-smi (unchanged, already worked)
+  - AMD: sysfs hwmon under /sys/class/drm/cardN/device/hwmon/hwmonM/
+    (untested - no AMD hardware to verify against, but the sysfs layout
+    is stable across kernel versions)
+
+Setup:
+    sudo apt install lm-sensors        # optional but recommended
+    sudo sensors-detect --auto         # optional, improves chip detection
+    pip install hidapi psutil
+    sudo cp 99-cooler.rules /etc/udev/rules.d/   # see README for udev rule
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+    python3 cooler_driver.py
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
 import struct
 import subprocess
 import time
 
 import hid
+import psutil
 
 VENDOR_ID = 0x2E3C
 PRODUCT_ID = 0x0A12
@@ -17,55 +46,237 @@ FLAG_CELSIUS = 0x00
 FLAG_FAHRENHEIT = 0x01
 
 
-def get_cpu_temp() -> int:
-    """Reads CPU temperature by parsing 'sensors' output (lm-sensors)."""
-    try:
-        output = subprocess.check_output(["sensors"], text=True, timeout=1.0)
-        for line in output.splitlines():
-            # Look for common CPU temperature identifiers in sensors output
-            line_lower = line.lower()
-            if any(
-                keyword in line_lower
-                for keyword in ["package id", "core 0", "tdie", "cpu temp"]
-            ):
-                match = re.search(r"\+?([0-9]+\.[0-9]+)°C", line)
-                if match:
-                    return int(float(match.group(1)))
-    except Exception as e:
-        print(f"Failed to read CPU temperature from sensors: {e}")
+_CPU_CHIP_HINTS = ("k10temp", "zenpower", "coretemp", "cpu_thermal", "cpu-thermal")
+_CPU_LABEL_HINTS = ("tctl", "tdie", "package id 0", "core 0", "cpu")
 
+
+def _cpu_temp_psutil() -> int | None:
+    if psutil is None:
+        return None
+    try:
+        temps = psutil.sensors_temperatures()
+    except Exception:  # noqa: BLE001
+        return None
+    if not temps:
+        return None
+
+    for chip in _CPU_CHIP_HINTS:
+        for chip_name, entries in temps.items():
+            if chip not in chip_name.lower():
+                continue
+            for e in entries:
+                if e.label and e.label.lower() in (
+                    "tctl",
+                    "tdie",
+                    "package id 0",
+                    "core 0",
+                ):
+                    return round(e.current)
+            if entries:
+                return round(entries[0].current)
+
+    for chip_name, entries in temps.items():
+        for e in entries:
+            label = (e.label or "").lower()
+            if any(h in label for h in _CPU_LABEL_HINTS) or any(
+                h in chip_name.lower() for h in _CPU_CHIP_HINTS
+            ):
+                return round(e.current)
+
+    return None
+
+
+def _cpu_temp_sensors_json() -> int | None:
+    try:
+        output = subprocess.check_output(["sensors", "-j"], text=True, timeout=1.5)
+        data = json.loads(output)
+    except Exception:  # noqa: BLE001
+        return None
+
+    for chip, features in data.items():
+        if not any(h in chip.lower() for h in _CPU_CHIP_HINTS):
+            continue
+        for feat_name, vals in features.items():
+            if not isinstance(vals, dict):
+                continue
+            label = feat_name.lower()
+            for key, val in vals.items():
+                if (
+                    key.endswith("_input")
+                    and isinstance(val, (int, float))
+                    and any(
+                        h in label for h in ("tctl", "tdie", "package id 0", "core 0")
+                    )
+                ):
+                    return round(val)
+
+    for chip, features in data.items():
+        if not any(h in chip.lower() for h in _CPU_CHIP_HINTS):
+            continue
+        for feat_name, vals in features.items():
+            if not isinstance(vals, dict):
+                continue
+            for key, val in vals.items():
+                if key.endswith("_input") and isinstance(val, (int, float)):
+                    return round(val)
+    return None
+
+
+def _cpu_temp_hwmon_sysfs() -> int | None:
+    try:
+        for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+            name_path = f"{hwmon}/name"
+            try:
+                with open(name_path) as f:
+                    name = f.read().strip().lower()
+            except OSError:
+                continue
+            if not any(h in name for h in _CPU_CHIP_HINTS):
+                continue
+            for temp_input in sorted(glob.glob(f"{hwmon}/temp*_input")):
+                label_path = temp_input.replace("_input", "_label")
+                label = ""
+                if os.path.exists(label_path):
+                    with open(label_path) as f:
+                        label = f.read().strip().lower()
+                try:
+                    with open(temp_input) as f:
+                        milli = int(f.read().strip())
+                except (OSError, ValueError):
+                    continue
+                if (
+                    any(h in label for h in ("tctl", "tdie", "package id 0", "core 0"))
+                    or not label
+                ):
+                    return round(milli / 1000)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return None
+
+
+def get_cpu_temp() -> int:
+    for fn in (_cpu_temp_psutil, _cpu_temp_sensors_json, _cpu_temp_hwmon_sysfs):
+        result = fn()
+        if result is not None:
+            return result
+    print("Failed to read CPU temperature from any source")
     return 0
 
 
-def get_gpu_temp() -> int:
-    """Reads GPU temperature via nvidia-smi."""
+def _fan_rpm_psutil() -> int | None:
+    if psutil is None:
+        return None
+    try:
+        fans = psutil.sensors_fans()
+    except Exception:  # noqa: BLE001
+        return None
+    for entries in fans.values():
+        for e in entries:
+            if e.current and e.current > 0:
+                return int(e.current)
+    return None
+
+
+def _fan_rpm_sensors_json() -> int | None:
+    try:
+        output = subprocess.check_output(["sensors", "-j"], text=True, timeout=1.5)
+        data = json.loads(output)
+    except Exception:  # noqa: BLE001
+        return None
+    for features in data.values():
+        for feat_name, vals in features.items():
+            if not isinstance(vals, dict):
+                continue
+            for key, val in vals.items():
+                if (
+                    key.endswith("_input")
+                    and "fan" in feat_name.lower()
+                    and isinstance(val, (int, float))
+                    and val > 0
+                ):
+                    return int(val)
+    return None
+
+
+def _fan_rpm_hwmon_sysfs() -> int | None:
+    try:
+        for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+            for fan_input in sorted(glob.glob(f"{hwmon}/fan*_input")):
+                try:
+                    with open(fan_input) as f:
+                        rpm = int(f.read().strip())
+                except (OSError, ValueError):
+                    continue
+                if rpm > 0:
+                    return rpm
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return None
+
+
+def get_fan_rpm() -> int:
+    for fn in (_fan_rpm_psutil, _fan_rpm_sensors_json, _fan_rpm_hwmon_sysfs):
+        result = fn()
+        if result is not None:
+            return result
+    # Not necessarily a failure - many CPU fans (esp. AIO pump/fan combos
+    # controlled by the cooler itself) simply don't expose an RPM sensor
+    # to the motherboard/hwmon. This is expected on some setups.
+    return 0
+
+
+def _gpu_temp_nvidia() -> int | None:
     try:
         output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
             text=True,
-            timeout=1.0,
+            timeout=1.5,
         )
-        return int(output.strip())
-    except Exception as e:
-        print(f"Failed to read GPU temperature: {e}")
-
-    return 0
+        return int(output.strip().splitlines()[0])
+    except Exception:  # noqa: BLE001
+        return None
 
 
-def get_fan_rpm() -> int:
-    """Reads fan RPM by parsing 'sensors' output (lm-sensors)."""
+def _gpu_temp_amd() -> int | None:
     try:
-        output = subprocess.check_output(["sensors"], text=True, timeout=1.0)
-        for line in output.splitlines():
-            if "fan" in line.lower() or "rpm" in line.lower():
-                match = re.search(r"(\d+)\s*RPM", line, re.IGNORECASE)
-                if match:
-                    rpm = int(match.group(1))
-                    if rpm > 0:
-                        return rpm
-    except Exception as e:
-        print(f"Failed to read fan speed from sensors: {e}")
+        for hwmon in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*"):
+            name_path = f"{hwmon}/name"
+            try:
+                with open(name_path) as f:
+                    name = f.read().strip().lower()
+            except OSError:
+                continue
+            if "amdgpu" not in name:
+                continue
 
+            best = None
+            for temp_input in sorted(glob.glob(f"{hwmon}/temp*_input")):
+                label_path = temp_input.replace("_input", "_label")
+                label = ""
+                if os.path.exists(label_path):
+                    with open(label_path) as f:
+                        label = f.read().strip().lower()
+                try:
+                    with open(temp_input) as f:
+                        milli = int(f.read().strip())
+                except (OSError, ValueError):
+                    continue
+                if label == "junction":
+                    return round(milli / 1000)
+                if best is None:
+                    best = round(milli / 1000)
+            if best is not None:
+                return best
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return None
+
+
+def get_gpu_temp() -> int:
+    for fn in (_gpu_temp_nvidia, _gpu_temp_amd):
+        result = fn()
+        if result is not None:
+            return result
     return 0
 
 
@@ -79,14 +290,8 @@ def update_cooler_display(
 ):
     payload = [0x00] * 65
     payload[0] = 0x20
-
     payload[1] = display_mode
-
-    if is_fahrenheit:
-        payload[2] = FLAG_FAHRENHEIT
-    else:
-        payload[2] = FLAG_CELSIUS
-
+    payload[2] = FLAG_FAHRENHEIT if is_fahrenheit else FLAG_CELSIUS
     payload[6] = max(0, min(cpu_temp, 255))
     payload[9] = max(0, min(gpu_temp, 255))
 
@@ -108,31 +313,24 @@ def main(
     rpm_override: int | None = None,
     is_fahrenheit: bool = False,
 ):
-    if show_metrics is None or show_metrics == []:
+    if not show_metrics:
         show_metrics = ["cpu", "gpu", "fan"]
 
-    mode_mapping = {
-        "cpu": MODE_CPU,
-        "gpu": MODE_GPU,
-        "fan": MODE_RPM,
-        "rpm": MODE_RPM,
-    }
-
-    cycle_modes = []
-    for metric in show_metrics:
-        metric_lower = metric.lower()
-        if metric_lower in mode_mapping:
-            cycle_modes.append(mode_mapping[metric_lower])
+    mode_mapping = {"cpu": MODE_CPU, "gpu": MODE_GPU, "fan": MODE_RPM, "rpm": MODE_RPM}
+    cycle_modes = [
+        mode_mapping[m.lower()] for m in show_metrics if m.lower() in mode_mapping
+    ]
+    if not cycle_modes:
+        cycle_modes = [MODE_CPU]
 
     cooler = None
-
     try:
         cooler = hid.device()
         cooler.open(VENDOR_ID, PRODUCT_ID)
         cooler.set_nonblocking(1)
 
         cycle_index = 0
-        last_mode_switch_time = time.time()
+        last_switch = time.time()
         current_mode = cycle_modes[cycle_index]
 
         while True:
@@ -140,12 +338,11 @@ def main(
             gpu_t = gpu_override if gpu_override is not None else get_gpu_temp()
             fan_rpm = rpm_override if rpm_override is not None else get_fan_rpm()
 
-            current_time = time.time()
-
-            if current_time - last_mode_switch_time >= mode_switch_interval:
+            now = time.time()
+            if now - last_switch >= mode_switch_interval:
                 cycle_index = (cycle_index + 1) % len(cycle_modes)
                 current_mode = cycle_modes[cycle_index]
-                last_mode_switch_time = current_time
+                last_switch = now
 
             update_cooler_display(
                 device=cooler,
@@ -155,7 +352,6 @@ def main(
                 rpm=fan_rpm,
                 is_fahrenheit=is_fahrenheit,
             )
-
             time.sleep(0.5)
 
     except KeyboardInterrupt:
@@ -171,7 +367,7 @@ def main(
 
 if __name__ == "__main__":
     main(
-        mode_switch_interval=0.5,
+        mode_switch_interval=3.0,
         show_metrics=[],
         is_fahrenheit=False,
     )
