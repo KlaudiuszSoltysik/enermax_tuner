@@ -1,29 +1,7 @@
 #!/usr/bin/env python3
-"""
-USB HID CPU/GPU/fan display driver for coolers without native Linux support.
-
-Sensor reading strategy (in order of preference):
-  1. psutil (reads Linux hwmon sysfs directly - no locale/formatting issues)
-  2. `sensors -j` (lm-sensors JSON output - structured, no regex needed)
-  3. Raw hwmon sysfs scan (last resort, no dependencies at all)
-
-GPU:
-  - NVIDIA: nvidia-smi (unchanged, already worked)
-  - AMD: sysfs hwmon under /sys/class/drm/cardN/device/hwmon/hwmonM/
-    (untested - no AMD hardware to verify against, but the sysfs layout
-    is stable across kernel versions)
-
-Setup:
-    sudo apt install lm-sensors        # optional but recommended
-    sudo sensors-detect --auto         # optional, improves chip detection
-    pip install hidapi psutil
-    sudo cp 99-cooler.rules /etc/udev/rules.d/   # see README for udev rule
-    sudo udevadm control --reload-rules && sudo udevadm trigger
-    python3 cooler_driver.py
-"""
-
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
@@ -32,7 +10,11 @@ import subprocess
 import time
 
 import hid
-import psutil
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 VENDOR_ID = 0x2E3C
 PRODUCT_ID = 0x0A12
@@ -365,9 +347,57 @@ def main(
             cooler.close()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="USB HID display driver for ETS-TD60 Digital ARGB CPU Air Cooler."
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=3.0,
+        metavar="SECONDS",
+        help="how long to show each metric before cycling to the next (default: 3.0)",
+    )
+    parser.add_argument(
+        "--metrics",
+        type=str,
+        default="cpu,gpu,fan",
+        metavar="LIST",
+        help="comma-separated metrics to cycle through: cpu,gpu,fan (default: cpu,gpu,fan)",
+    )
+    parser.add_argument(
+        "--fahrenheit",
+        action="store_true",
+        help="display temperatures in Fahrenheit instead of Celsius",
+    )
+    parser.add_argument(
+        "--cpu-override",
+        type=int,
+        default=None,
+        metavar="DEGREES",
+        help="show this fixed value instead of the real CPU temp (for testing)",
+    )
+    parser.add_argument(
+        "--gpu-override",
+        type=int,
+        default=None,
+        metavar="DEGREES",
+        help="show this fixed value instead of the real GPU temp (for testing)",
+    )
+    parser.add_argument(
+        "--rpm-override",
+        type=int,
+        default=None,
+        metavar="RPM",
+        help="show this fixed value instead of the real fan RPM (for testing)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     main(
-        mode_switch_interval=3.0,
-        show_metrics=[],
-        is_fahrenheit=False,
+        mode_switch_interval=args.interval,
+        show_metrics=[m.strip() for m in args.metrics.split(",") if m.strip()],
+        is_fahrenheit=args.fahrenheit,
     )
