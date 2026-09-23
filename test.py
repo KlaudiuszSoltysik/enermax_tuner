@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-"""
-Diagnostic tool: dumps raw HID input reports coming FROM the cooler.
-
-Many of these display coolers measure fan RPM themselves and report it
-back to the host over HID (that's how the Windows app shows it) rather
-than exposing it to the motherboard's fan headers. If that's the case
-here, the RPM value will show up as changing bytes in this dump.
-
-Usage:
-    python3 hid_sniffer.py
-
-Then, while it's running:
-    - Note the "baseline" bytes.
-    - Change fan speed (BIOS fan curve, or briefly slow the fan with a
-      finger - carefully) and see which byte position changes value in
-      a way that correlates with RPM (e.g. goes from ~0x2C to ~0x1A as
-      RPM increases, or read as a 16-bit value across two bytes).
-    - If NOTHING changes at all when RPM changes, the device likely
-      doesn't report RPM back over HID either, and the Windows app may
-      be reading it from a different source (e.g. a fan splitter/hub
-      with its own controller chip, a separate HID device/interface, or
-      polling a different USB endpoint). Run `lsusb -v` and check if the
-      cooler exposes multiple HID interfaces - try opening each.
-"""
-
 import sys
 import time
 
