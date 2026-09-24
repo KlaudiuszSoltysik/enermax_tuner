@@ -29,14 +29,14 @@ python3 cooler_driver.py --interval 5 --metrics cpu,gpu,fan
 
 ### Available options
 
-| Flag              | Default       | Description                                                        |
-|-------------------|---------------|----------------------------------------------------------------------|
-| `--interval`       | `3.0`         | Seconds to show each metric before cycling to the next                |
-| `--metrics`        | `cpu,gpu,fan` | Comma-separated list of metrics to cycle through                     |
-| `--fahrenheit`     | off           | Display temperatures in °F instead of °C                             |
-| `--cpu-override`   | none          | Show a fixed CPU temp instead of the real reading (testing)          |
-| `--gpu-override`   | none          | Show a fixed GPU temp instead of the real reading (testing)          |
-| `--rpm-override`   | none          | Show a fixed fan RPM instead of the real reading (testing)           |
+| Flag             | Default       | Description                                                 |
+| ---------------- | ------------- | ----------------------------------------------------------- |
+| `--interval`     | `3.0`         | Seconds to show each metric before cycling to the next      |
+| `--metrics`      | `cpu,gpu,fan` | Comma-separated list of metrics to cycle through            |
+| `--fahrenheit`   | off           | Display temperatures in °F instead of °C                    |
+| `--cpu-override` | none          | Show a fixed CPU temp instead of the real reading (testing) |
+| `--gpu-override` | none          | Show a fixed GPU temp instead of the real reading (testing) |
+| `--rpm-override` | none          | Show a fixed fan RPM instead of the real reading (testing)  |
 
 Same table applies whether you run the script directly or pass the flags
 to `install.sh` (they get baked into the systemd service's `ExecStart`).
